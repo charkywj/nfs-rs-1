@@ -15,19 +15,19 @@ use super::compound::{
     CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
     decode_create_response, decode_delegreturn_response,
-    decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
-    decode_lockt_response, decode_lookup_getattr_response, decode_open_response,
-    decode_read_response, decode_readdir_response, decode_readlink_response,
+    decode_getattr_response as decode_getattr_compound, decode_link_response,
+    decode_lock_op_outcome, decode_lockt_response, decode_lookup_getattr_response,
+    decode_open_response, decode_read_response, decode_readdir_response, decode_readlink_response,
     decode_release_lockowner_response, decode_remove_response, decode_rename_response,
-    decode_setattr_response, decode_stateid_response, decode_write_response,
-    open_succeeded_before_compound_failure,
+    decode_setattr_response, decode_stateid_op_outcome, decode_stateid_response,
+    decode_write_response, open_succeeded_before_compound_failure,
 };
 use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::recovery::{
     FreshOpenSpec, RecoveryContext, StateidRecovery, bump_stateid_seqid, classify_stateid_failure,
-    close_fresh_open, consumes_owner_seqid, establish_identity, fresh_open_lane_with_seqid,
+    close_fresh_open, establish_identity, fresh_open_lane_with_seqid, lock_op_consumes_seqid,
     open_owner_wire, recovery_failure, set_stateid_seqid, state_recovery_exhausted, stateid_hex,
-    stateid_seqid, status_consumes_seqid,
+    stateid_op_consumes_seqid, stateid_seqid,
 };
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::dialer::Endpoint;
@@ -414,6 +414,33 @@ fn context(
     )
 }
 
+/// Decodes a `PUTFH + <stateid op>` reply together with whether that request
+/// consumed the owner seqid. A PUTFH failure reports a non-zero overall status
+/// but never ran the operation, so it must not advance the cursor.
+fn decode_stateid_call(
+    response: Result<Bytes>,
+    opcode: u32,
+    name: &str,
+) -> (Result<[u8; 16]>, bool) {
+    match response.and_then(|response| decode_stateid_op_outcome(response, opcode, name)) {
+        Ok(outcome) => {
+            let consumed = stateid_op_consumes_seqid(&outcome);
+            (outcome.into_result(), consumed)
+        }
+        Err(error) => (Err(error), false),
+    }
+}
+
+fn decode_lock_call(response: Result<Bytes>, opcode: u32, name: &str) -> (Result<[u8; 16]>, bool) {
+    match response.and_then(|response| decode_lock_op_outcome(response, opcode, name)) {
+        Ok(outcome) => {
+            let consumed = lock_op_consumes_seqid(&outcome);
+            (outcome.into_result(), consumed)
+        }
+        Err(error) => (Err(error), false),
+    }
+}
+
 async fn settled_call(
     rpc: rpc::Client,
     request: Vec<u8>,
@@ -515,11 +542,20 @@ impl Mount40 {
                     lock_seqid_for_task,
                     OperationClass::ReplaySensitive,
                 );
-                let decoded = rpc
+                let response = rpc
                     .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .and_then(|response| decode_lock_response(response, 12, "LOCK"));
-                if consumes_owner_seqid(&decoded) {
+                    .await;
+                let (decoded, consumed) = match response {
+                    Ok(response) => match decode_lock_op_outcome(response, 12, "LOCK") {
+                        Ok(outcome) => {
+                            let consumed = lock_op_consumes_seqid(&outcome);
+                            (outcome.into_result(), consumed)
+                        }
+                        Err(error) => (Err(error), false),
+                    },
+                    Err(error) => (Err(error), false),
+                };
+                if consumed {
                     open.next_seqid = open.next_seqid.wrapping_add(1);
                 }
                 let stateid =
@@ -873,11 +909,13 @@ impl Mount40 {
                 lane.next_seqid,
                 OperationClass::ReplaySensitive,
             );
-            let mut result = rpc
-                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-                .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+            let (mut result, mut close_seqid_consumed) = decode_stateid_call(
+                rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await,
+                4,
+                "CLOSE",
+            );
+            result = result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
             // RFC 7530 §9.1.7: OLD_STATEID is not in the "seqid does not
             // advance" exception list, so the rejected CLOSE consumed the
             // open-owner seqid. Advance both seqids before resending; reusing
@@ -896,11 +934,13 @@ impl Mount40 {
                     lane.next_seqid,
                     OperationClass::ReplaySensitive,
                 );
-                result = rpc
-                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                (result, close_seqid_consumed) = decode_stateid_call(
+                    rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                        .await,
+                    4,
+                    "CLOSE",
+                );
+                result = result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
             }
             // RFC 7530 §9.1.4.4: BAD_STATEID is also returned when the stateid
             // seqid is later than the server's, in which case the open state
@@ -922,11 +962,16 @@ impl Mount40 {
                     lane.next_seqid,
                     OperationClass::ReplaySensitive,
                 );
-                result = rpc
-                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                let (probe_result, probe_consumed) = decode_stateid_call(
+                    rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                        .await,
+                    4,
+                    "CLOSE",
+                );
+                result = probe_result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                // Consumption is monotonic: a probe that never executed must
+                // not erase what the first CLOSE already consumed.
+                close_seqid_consumed |= probe_consumed;
             }
             match result {
                 Ok(stateid) => {
@@ -974,7 +1019,9 @@ impl Mount40 {
                     // consumed the open-owner seqid, whether or not this was
                     // the OLD_STATEID retry. Advance it so the next CLOSE does
                     // not replay a consumed seqid and get stuck on BAD_SEQID.
-                    if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
+                    // A PUTFH failure also reaches this arm with a non-zero
+                    // status but never ran the CLOSE, so it must not advance.
+                    if close_seqid_consumed {
                         lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     }
                     // Do not leave the lane permanently wedged: a failed CLOSE
@@ -1062,16 +1109,12 @@ impl Mount40 {
         let attempt =
             fresh_open_lane_with_seqid(&self.rpc, &self.auth, &spec, open.next_seqid, operation)
                 .await;
+        // RFC 7530 §9.1.7: record only what the last OPEN actually consumed; a
+        // PUTFH failure leaves the cursor untouched.
+        attempt.record_consumption(&mut open);
         let fresh = match attempt.result {
             Ok(fresh) => fresh,
             Err(error) => {
-                // RFC 7530 §9.1.7: a failed OPEN still consumes its open-owner
-                // seqid unless the status is in the exception table. Record the
-                // consumed value, otherwise a later attempt would replay the
-                // cached reply (e.g. NFS4ERR_GRACE) instead of re-opening.
-                if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
-                    open.next_seqid = attempt.sent_seqid.wrapping_add(1);
-                }
                 return Err(error);
             }
         };
@@ -2285,11 +2328,13 @@ impl Mount for Mount40 {
                 .putfh(&fh)
                 .locku(lock_type, lane.next_seqid, &lane.stateid, offset, length)
                 .encode_with_header(&auth);
-            let mut decoded = rpc
-                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-                .and_then(|response| decode_lock_response(response, 14, "LOCKU"));
-            if consumes_owner_seqid(&decoded) {
+            let (mut decoded, consumed) = decode_lock_call(
+                rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await,
+                14,
+                "LOCKU",
+            );
+            if consumed {
                 lane.next_seqid = lane.next_seqid.wrapping_add(1);
             }
             // RFC 7530 §9.1.4.4: OLD_STATEID means the lock state still exists
@@ -2314,11 +2359,14 @@ impl Mount for Mount40 {
                     lane.next_seqid,
                     OperationClass::ReplaySensitive,
                 );
-                decoded = rpc
-                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .and_then(|response| decode_lock_response(response, 14, "LOCKU"));
-                if consumes_owner_seqid(&decoded) {
+                let (retried, retry_consumed) = decode_lock_call(
+                    rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                        .await,
+                    14,
+                    "LOCKU",
+                );
+                decoded = retried;
+                if retry_consumed {
                     lane.next_seqid = lane.next_seqid.wrapping_add(1);
                 }
             }
@@ -2347,11 +2395,14 @@ impl Mount for Mount40 {
                         lane.next_seqid,
                         OperationClass::ReplaySensitive,
                     );
-                    decoded = rpc
-                        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                        .await
-                        .and_then(|response| decode_lock_response(response, 14, "LOCKU"));
-                    if consumes_owner_seqid(&decoded) {
+                    let (retried, retry_consumed) = decode_lock_call(
+                        rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                            .await,
+                        14,
+                        "LOCKU",
+                    );
+                    decoded = retried;
+                    if retry_consumed {
                         lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     }
                 }
